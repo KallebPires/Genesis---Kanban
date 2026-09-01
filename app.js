@@ -1,4 +1,4 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
+import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
 import {
   getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut
 } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-auth.js";
@@ -55,9 +55,9 @@ function brl(v) { return 'R$ ' + (v / 1000).toFixed(0) + 'k'; }
 /* ---------- state ---------- */
 let state = {
   authReady: false, authed: false, currentUserId: null, usersLoaded: false,
-  authMode: 'login', loginEmail: '', loginPass: '', loginError: '', loginBusy: false,
-  signupName: '', signupRole: '',
+  loginEmail: '', loginPass: '', loginError: '', loginBusy: false,
   profileName: '', profileRole: '', profileError: '', profileBusy: false,
+  inviteError: '', inviteBusy: false,
   screen: 'dash', projectFilter: 'all', query: '', openId: null, projectId: null,
   form: null, draft: {}, commentDraft: '', dragId: null, showInvite: false,
   users: [], projects: [], tasks: []
@@ -70,7 +70,7 @@ function setState(patch) {
 }
 
 /* ---------- core logic ---------- */
-function me() { return state.users.find(u => u.id === state.currentUserId) || { id: state.currentUserId, name: 'Carregando…', role: '', email: '', initials: '··', color: '#5F6878' }; }
+function me() { return state.users.find(u => u.id === state.currentUserId) || { id: state.currentUserId, name: 'Carregando…', role: '', email: '', initials: '··', color: '#5F6878', isAdmin: false }; }
 function user(id) { return state.users.find(u => u.id === id) || { id: id, name: '—', role: '—', email: '—', initials: '—', color: '#5F6878' }; }
 function project(id) { return state.projects.find(p => p.id === id) || { id: id, name: '—', desc: '', color: '#5F6878', due: '—', status: '—', budget: 1, spent: 0, rate: '—' }; }
 function colName(id) { return (COLS.find(c => c.id === id) || COLS[0]).name; }
@@ -87,29 +87,40 @@ async function login() {
   }
 }
 
-async function signup() {
-  const name = state.signupName.trim(), role = state.signupRole.trim();
-  const email = state.loginEmail.trim().toLowerCase(), pass = state.loginPass;
-  if (!name) return setState({ loginError: 'Informe seu nome.' });
-  if (!email || !pass) return setState({ loginError: 'Informe e-mail e senha.' });
-  if (pass.length < 6) return setState({ loginError: 'A senha precisa ter pelo menos 6 caracteres.' });
-  setState({ loginBusy: true, loginError: '' });
+function logout() { signOut(auth).catch(e => console.error(e)); }
+
+async function inviteUser() {
+  const d = state.draft;
+  const name = (d.name || '').trim(), role = (d.role || '').trim();
+  const email = (d.email || '').trim().toLowerCase(), pass = (d.pass || '').trim();
+  if (!me().isAdmin) return;
+  if (!name) return setState({ inviteError: 'Informe o nome da pessoa.' });
+  if (!email || !pass) return setState({ inviteError: 'Informe e-mail e senha temporária.' });
+  if (pass.length < 6) return setState({ inviteError: 'A senha temporária precisa ter pelo menos 6 caracteres.' });
+  setState({ inviteBusy: true, inviteError: '' });
+  // Uses a secondary Firebase app instance so creating the new account doesn't
+  // sign the admin out of their own session (createUserWithEmailAndPassword
+  // signs in as the newly created user on whichever auth instance it's called with).
+  const secondaryApp = initializeApp(firebaseConfig, 'invite-' + Date.now());
+  const secondaryAuth = getAuth(secondaryApp);
   try {
-    const cred = await createUserWithEmailAndPassword(auth, email, pass);
+    const cred = await createUserWithEmailAndPassword(secondaryAuth, email, pass);
     const colors = ['#0B71F5', '#2ECC8F', '#B07CFF', '#F5A70B', '#FF7A86'];
     const parts = name.split(' ');
     const initials = (parts[0][0] + (parts[1] ? parts[1][0] : '')).toUpperCase();
     await setDoc(doc(db, 'users', cred.user.uid), {
       name, role: role || 'Colaborador', email, initials,
       color: colors[Math.floor(Math.random() * colors.length)],
-      createdAt: serverTimestamp()
+      invitedBy: me().name, createdAt: serverTimestamp()
     });
+    await signOut(secondaryAuth);
+    setState({ form: null, inviteBusy: false });
   } catch (e) {
-    setState({ loginError: mapAuthError(e), loginBusy: false });
+    setState({ inviteError: mapAuthError(e), inviteBusy: false });
+  } finally {
+    deleteApp(secondaryApp).catch(() => {});
   }
 }
-
-function logout() { signOut(auth).catch(e => console.error(e)); }
 
 async function completeProfile() {
   const name = state.profileName.trim(), role = state.profileRole.trim();
@@ -158,13 +169,15 @@ function buildBoard(list, projectId) {
 }
 
 function openForm(kind, seed) {
+  if (kind === 'user' && !me().isAdmin) return;
+  if (kind === 'task' && !state.projects.length) kind = 'project';
   const d = Object.assign({
     title: '', desc: '',
     projectId: (state.projects[0] && state.projects[0].id) || '',
     assigneeId: (state.users[0] && state.users[0].id) || me().id,
-    priority: 'Média', due: '', hours: '', col: 'todo', name: '', email: '', role: ''
+    priority: 'Média', due: '', hours: '', col: 'todo', name: '', email: '', role: '', pass: ''
   }, seed || {});
-  setState({ form: kind, draft: d, openId: null });
+  setState({ form: kind, draft: d, openId: null, inviteError: '' });
 }
 function setDraft(k, v) { setState(s => ({ draft: Object.assign({}, s.draft, { [k]: v }) })); }
 
@@ -181,6 +194,8 @@ function submit() {
     const p = { name: d.name, desc: d.desc || 'Sem descrição.', color: colors[state.projects.length % colors.length], due: d.due || 'sem prazo', status: 'Planejado', budget: Number(d.hours) * 1000 || 30000, spent: 0, rate: 'R$ 130', createdAt: serverTimestamp() };
     addDoc(collection(db, 'projects'), p).catch(e => console.error(e));
     setState({ form: null });
+  } else if (kind === 'user') {
+    inviteUser();
   }
 }
 
@@ -212,7 +227,7 @@ function computeView() {
     projects: ['Projetos', 'Todos os projetos'],
     project: ['Projeto', s.projectId ? project(s.projectId).name : 'Projeto'],
     team: ['Equipe', 'Pessoas e acessos'],
-    finance: ['Financeiro', 'Receita, custos e caixa']
+    finance: ['Financeiro', 'Orçamento por projeto']
   };
   const cur = screens[s.screen] || screens.dash;
 
@@ -278,7 +293,7 @@ function computeView() {
   const isBoard = s.screen === 'board' || s.screen === 'mine';
   const boardList = s.screen === 'mine' ? mine.filter(t => s.projectFilter === 'all' || t.projectId === s.projectFilter) : scoped;
 
-  const formTitles = { task: ['Nova tarefa', 'criar tarefa'], project: ['Novo projeto', 'criar projeto'] };
+  const formTitles = { task: ['Nova tarefa', 'criar tarefa'], project: ['Novo projeto', 'criar projeto'], user: ['Convidar pessoa', 'criar acesso'] };
   const ft = formTitles[s.form] || formTitles.task;
   const d = s.draft;
   const field = (label, key, opts) => Object.assign({ label: label, key: key, value: d[key] || '', placeholder: '', isText: true, isSelect: false, isArea: false }, opts || {});
@@ -300,11 +315,17 @@ function computeView() {
     field('Prazo', 'due', { placeholder: 'ex: 30 out' }),
     field('Orçamento (R$ mil)', 'hours', { placeholder: 'ex: 60' })
   ];
+  if (s.form === 'user') formFields = [
+    field('Nome', 'name', { placeholder: 'Nome completo' }),
+    field('E-mail', 'email', { placeholder: 'nome@empresa.com' }),
+    field('Função', 'role', { placeholder: 'ex: Engenharia' }),
+    field('Senha temporária', 'pass', { placeholder: 'pelo menos 6 caracteres' })
+  ];
   return {
     authReady: s.authReady, isLogin: !s.authed, authed: s.authed,
-    authMode: s.authMode, signupName: s.signupName, signupRole: s.signupRole, loginBusy: s.loginBusy,
+    loginBusy: s.loginBusy,
     loginEmail: s.loginEmail, loginPass: s.loginPass, loginError: s.loginError,
-    showInvite: s.showInvite,
+    showInvite: s.showInvite, inviteError: s.inviteError, inviteBusy: s.inviteBusy,
     needsProfile: s.authed && s.usersLoaded && !s.users.find(u => u.id === s.currentUserId),
     profileName: s.profileName, profileRole: s.profileRole, profileError: s.profileError, profileBusy: s.profileBusy,
     me: m, users: s.users, nav: nav, query: s.query,
@@ -338,24 +359,12 @@ function computeView() {
     ],
 
     teamCards: s.users.map(u => ({
-      id: u.id, name: u.name, role: u.role, email: u.email, initials: u.initials, color: u.color,
+      id: u.id, name: u.name, role: u.role, email: u.email, initials: u.initials, color: u.color, isAdmin: !!u.isAdmin,
       openCount: s.tasks.filter(t => t.assigneeId === u.id && t.col !== 'done').length,
       doneCount: s.tasks.filter(t => t.assigneeId === u.id && t.col === 'done').length
     })),
 
-    finKpis: [
-      { label: 'Receita do mês', value: 'R$ 194k', sub: '+9% vs julho', deltaColor: '#2ECC8F' },
-      { label: 'Caixa', value: 'R$ 1,9M', sub: 'runway de 14 meses', deltaColor: '#8A93A6' },
-      { label: 'Queima mensal', value: 'R$ 136k', sub: '-4% vs julho', deltaColor: '#2ECC8F' },
-      { label: 'Meta do trimestre', value: '78%', sub: 'R$ 560k de R$ 720k', deltaColor: '#F5A70B' }
-    ],
-    months: months, expenses: expenses, budgets: budgets,
-    invoices: [
-      { who: 'Nuvem Atlas', value: 'R$ 12.400', kind: 'Infraestrutura', due: '05 set', status: 'A pagar', color: '#F5A70B' },
-      { who: 'Cliente Vertex', value: 'R$ 48.000', kind: 'Fatura emitida', due: '10 set', status: 'Aberta', color: '#8CBEFF' },
-      { who: 'Studio Lume', value: 'R$ 9.800', kind: 'Serviço de design', due: '28 ago', status: 'Vencida', color: '#FF7A86' },
-      { who: 'Cliente Orbe', value: 'R$ 63.500', kind: 'Fatura emitida', due: '22 ago', status: 'Paga', color: '#2ECC8F' }
-    ],
+    budgets: budgets,
 
     modalTask: modalTask, openTask: openTask, colOptions: COLS.map(c => ({ id: c.id, name: c.name })),
     prioOptions: ['Alta', 'Média', 'Baixa'].map(p => {
@@ -462,35 +471,25 @@ function tLogin(V) {
 
     <div style="display:flex; align-items:center; justify-content:center; padding:56px 44px">
       <div style="width:100%; max-width:372px; padding:30px; border-radius:14px; border:1px solid rgba(246,253,255,.1); background:linear-gradient(165deg, #10151F, #090C13); box-shadow:0 26px 70px rgba(0,0,0,.6)">
-        <h2 style="margin:0 0 6px; font-size:19px; font-weight:400">${V.authMode === 'signup' ? 'Criar conta' : 'Entrar'}</h2>
-        <p style="margin:0 0 24px; font-size:12.5px; color:#8A93A6">${V.authMode === 'signup' ? 'Crie sua conta com o e-mail da equipe.' : 'Use o e-mail corporativo da sua conta.'}</p>
+        <h2 style="margin:0 0 6px; font-size:19px; font-weight:400">Entrar</h2>
+        <p style="margin:0 0 24px; font-size:12.5px; color:#8A93A6">Use o e-mail corporativo da sua conta.</p>
         <div style="display:flex; flex-direction:column; gap:15px">
-          ${V.authMode === 'signup' ? `
-          <div>
-            <div style="font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:#6F7A8D; margin-bottom:7px">Nome completo</div>
-            <input data-field="signupName" data-input="${on(e => setState({ signupName: e.target.value }))}" value="${escAttr(V.signupName)}" type="text" placeholder="Seu nome" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(246,253,255,.12); background:#111725; color:#F6FDFF; font-size:13px; outline:none">
-          </div>
-          <div>
-            <div style="font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:#6F7A8D; margin-bottom:7px">Função (opcional)</div>
-            <input data-field="signupRole" data-input="${on(e => setState({ signupRole: e.target.value }))}" value="${escAttr(V.signupRole)}" type="text" placeholder="ex: Produto, Engenharia" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(246,253,255,.12); background:#111725; color:#F6FDFF; font-size:13px; outline:none">
-          </div>` : ''}
           <div>
             <div style="font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:#6F7A8D; margin-bottom:7px">E-mail</div>
-            <input data-field="loginEmail" data-input="${on(e => setState({ loginEmail: e.target.value, loginError: '' }))}" data-keydown="${on(e => { if (e.key === 'Enter') (V.authMode === 'signup' ? signup() : login()); })}" value="${escAttr(V.loginEmail)}" type="email" placeholder="nome@suaempresa.com" autocomplete="username" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(246,253,255,.12); background:#111725; color:#F6FDFF; font-size:13px; outline:none">
+            <input data-field="loginEmail" data-input="${on(e => setState({ loginEmail: e.target.value, loginError: '' }))}" data-keydown="${on(e => { if (e.key === 'Enter') login(); })}" value="${escAttr(V.loginEmail)}" type="email" placeholder="nome@suaempresa.com" autocomplete="username" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(246,253,255,.12); background:#111725; color:#F6FDFF; font-size:13px; outline:none">
           </div>
           <div>
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:7px">
               <span style="font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:#6F7A8D">Senha</span>
-              ${V.authMode === 'signup' ? '' : '<a href="#" style="font-size:11px">esqueci a senha</a>'}
+              <a href="#" style="font-size:11px">esqueci a senha</a>
             </div>
-            <input data-field="loginPass" data-input="${on(e => setState({ loginPass: e.target.value, loginError: '' }))}" data-keydown="${on(e => { if (e.key === 'Enter') (V.authMode === 'signup' ? signup() : login()); })}" value="${escAttr(V.loginPass)}" type="password" placeholder="••••••••" autocomplete="${V.authMode === 'signup' ? 'new-password' : 'current-password'}" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(246,253,255,.12); background:#111725; color:#F6FDFF; font-size:13px; outline:none">
+            <input data-field="loginPass" data-input="${on(e => setState({ loginPass: e.target.value, loginError: '' }))}" data-keydown="${on(e => { if (e.key === 'Enter') login(); })}" value="${escAttr(V.loginPass)}" type="password" placeholder="••••••••" autocomplete="current-password" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(246,253,255,.12); background:#111725; color:#F6FDFF; font-size:13px; outline:none">
           </div>
           ${V.loginError ? `
           <div style="display:flex; align-items:center; gap:8px; padding:9px 11px; border-radius:8px; border:1px solid rgba(255,77,94,.35); background:rgba(255,77,94,.08); font-size:12px; color:#FF9AA3">
             <i class="ph ph-warning-circle" style="font-size:14px"></i>${esc(V.loginError)}
           </div>` : ''}
-          <button data-click="${on(() => V.authMode === 'signup' ? signup() : login())}" ${V.loginBusy ? 'disabled' : ''} style="margin-top:4px; padding:11px; border-radius:8px; border:1px solid #0B71F5; background:rgba(11,113,245,.14); color:#8CBEFF; font-size:13px"${hoverAttr('background:rgba(11,113,245,.28); color:#F6FDFF')}>${V.loginBusy ? 'Aguarde…' : (V.authMode === 'signup' ? 'Criar conta' : 'Entrar')}</button>
-          <button data-click="${on(() => setState({ authMode: V.authMode === 'signup' ? 'login' : 'signup', loginError: '' }))}" style="background:none; border:none; color:#6F7A8D; font-size:12px; padding:4px 0; text-align:center">${V.authMode === 'signup' ? 'Já tem conta? Entrar' : 'Não tem conta? Criar conta'}</button>
+          <button data-click="${on(() => login())}" ${V.loginBusy ? 'disabled' : ''} style="margin-top:4px; padding:11px; border-radius:8px; border:1px solid #0B71F5; background:rgba(11,113,245,.14); color:#8CBEFF; font-size:13px"${hoverAttr('background:rgba(11,113,245,.28); color:#F6FDFF')}>${V.loginBusy ? 'Aguarde…' : 'Entrar'}</button>
         </div>
       </div>
     </div>
@@ -570,7 +569,7 @@ function boardColumn(c) {
 function tDash(V) {
   return `
   <div style="display:flex; flex-direction:column; gap:26px">
-    <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:14px">
+    <div style="display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:14px">
       ${V.kpis.map(k => `
         <div style="padding:16px 17px; border-radius:10px; border:1px solid rgba(246,253,255,.08); background:linear-gradient(160deg, #10151F, #0B0E17)">
           <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px">
@@ -695,7 +694,10 @@ function tTeam(V) {
         <div style="display:flex; align-items:center; gap:12px">
           <div style="width:38px; height:38px; border-radius:50%; background:${u.color}22; border:1px solid ${u.color}66; color:${u.color}; font-size:13px; display:flex; align-items:center; justify-content:center">${esc(u.initials)}</div>
           <div style="min-width:0">
-            <div style="font-size:14px">${esc(u.name)}</div>
+            <div style="display:flex; align-items:center; gap:7px">
+              <span style="font-size:14px">${esc(u.name)}</span>
+              ${u.isAdmin ? '<span style="font-size:9.5px; padding:2px 6px; border-radius:20px; border:1px solid rgba(11,113,245,.5); color:#8CBEFF; text-transform:uppercase; letter-spacing:.06em">admin</span>' : ''}
+            </div>
             <div style="font-size:11.5px; color:#8A93A6">${esc(u.role)}</div>
           </div>
         </div>
@@ -706,7 +708,7 @@ function tTeam(V) {
           <button data-click="${on(() => openForm('task', { assigneeId: u.id }))}" style="margin-left:auto; align-self:flex-end; padding:7px 11px; border-radius:7px; border:1px solid rgba(11,113,245,.55); background:none; color:#8CBEFF; font-size:11.5px"${hoverAttr('background:rgba(11,113,245,.16)')}>atribuir</button>
         </div>
       </div>`).join('')}
-      <button data-click="${on(() => setState({ showInvite: true }))}" style="min-height:150px; border-radius:11px; border:1px dashed rgba(246,253,255,.15); background:none; color:#6F7A8D; font-size:13px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:9px"${hoverAttr('border-color:rgba(11,113,245,.55); color:#8CBEFF')}>
+      <button data-click="${on(() => V.me.isAdmin ? openForm('user') : setState({ showInvite: true }))}" style="min-height:150px; border-radius:11px; border:1px dashed rgba(246,253,255,.15); background:none; color:#6F7A8D; font-size:13px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:9px"${hoverAttr('border-color:rgba(11,113,245,.55); color:#8CBEFF')}>
         <i class="ph ph-user-plus" style="font-size:22px"></i>Adicionar usuário
       </button>
     </div>
@@ -714,90 +716,35 @@ function tTeam(V) {
 }
 
 function tFinance(V) {
+  if (!V.budgets.length) {
+    return `
+    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; padding:80px 20px; color:#6F7A8D; text-align:center">
+      <i class="ph ph-chart-line-up" style="font-size:28px"></i>
+      <div style="font-size:13.5px">Nenhum projeto com orçamento ainda.</div>
+      <div style="font-size:12px">Crie um projeto e informe o orçamento para ver o acompanhamento aqui.</div>
+    </div>`;
+  }
   return `
   <div style="display:flex; flex-direction:column; gap:24px">
-    <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:14px">
-      ${V.finKpis.map(k => `
-      <div style="padding:16px 17px; border-radius:10px; border:1px solid rgba(246,253,255,.08); background:linear-gradient(160deg, #10151F, #0B0E17)">
-        <div style="font-size:11px; color:#6F7A8D; letter-spacing:.1em; text-transform:uppercase">${esc(k.label)}</div>
-        <div style="font-size:25px; margin-top:11px">${esc(k.value)}</div>
-        <div style="font-size:11.5px; color:${k.deltaColor}; margin-top:5px">${esc(k.sub)}</div>
-      </div>`).join('')}
-    </div>
-
-    <div style="display:grid; grid-template-columns:minmax(0,1.4fr) minmax(0,1fr); gap:20px">
-      <section style="padding:19px 20px; border-radius:11px; border:1px solid rgba(246,253,255,.08); background:#0A0D14">
-        <div style="display:flex; align-items:baseline; gap:14px; margin-bottom:20px">
-          <h2 style="margin:0; font-size:15px; font-weight:500">Receita mensal vs meta</h2>
-          <span style="font-size:11px; color:#6F7A8D">R$ mil</span>
-          <span style="margin-left:auto; display:flex; align-items:center; gap:14px; font-size:11px; color:#8A93A6">
-            <span style="display:flex; align-items:center; gap:6px"><span style="width:9px; height:9px; border-radius:2px; background:#0B71F5"></span>realizado</span>
-            <span style="display:flex; align-items:center; gap:6px"><span style="width:9px; height:2px; background:#6F7A8D"></span>meta</span>
-          </span>
-        </div>
-        <div style="display:flex; align-items:flex-end; gap:14px; height:190px">
-          ${V.months.map(m => `
-          <div style="flex:1; display:flex; flex-direction:column; align-items:center; gap:8px; height:100%; justify-content:flex-end">
-            <div style="position:relative; width:100%; display:flex; justify-content:center; height:100%; align-items:flex-end">
-              <div style="width:62%; height:${m.h}%; border-radius:4px 4px 0 0; background:linear-gradient(180deg, #2E8CFF, #0B71F5)"></div>
-              <div style="position:absolute; left:8%; right:8%; bottom:${m.gh}%; height:1px; background:#6F7A8D"></div>
-            </div>
-            <span style="font-size:10.5px; color:#6F7A8D">${esc(m.label)}</span>
-          </div>`).join('')}
-        </div>
-      </section>
-
-      <section style="padding:19px 20px; border-radius:11px; border:1px solid rgba(246,253,255,.08); background:#0A0D14">
-        <h2 style="margin:0 0 18px; font-size:15px; font-weight:500">Despesas por categoria</h2>
-        <div style="display:flex; flex-direction:column; gap:14px">
-          ${V.expenses.map(e => `
-          <div>
-            <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:6px">
-              <span style="color:#C4CCDA">${esc(e.label)}</span><span style="color:#8A93A6">${esc(e.value)}</span>
-            </div>
-            <div style="height:5px; border-radius:3px; background:rgba(246,253,255,.07); overflow:hidden">
-              <div style="height:100%; width:${e.pct}%; background:${e.color}"></div>
-            </div>
-          </div>`).join('')}
-        </div>
-      </section>
-    </div>
-
-    <div style="display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:20px">
-      <section>
-        <h2 style="margin:0 0 12px; font-size:15px; font-weight:500">Orçamento por projeto</h2>
-        <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(240px,1fr)); gap:12px">
-          ${V.budgets.map(b => `
-          <div style="padding:15px; border-radius:10px; border:1px solid rgba(246,253,255,.08); background:#0C1017">
-            <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px">
-              <span style="width:7px; height:7px; border-radius:50%; background:${b.color}"></span>
-              <span style="font-size:13px">${esc(b.name)}</span>
-            </div>
-            <div style="display:flex; justify-content:space-between; font-size:11.5px; color:#6F7A8D; margin-bottom:6px">
-              <span>${esc(b.spent)} de ${esc(b.budget)}</span><span style="color:${b.pctColor}">${esc(b.pctLabel)}</span>
-            </div>
-            <div style="height:4px; border-radius:3px; background:rgba(246,253,255,.08); overflow:hidden">
-              <div style="height:100%; width:${b.pct}%; background:${b.pctColor}"></div>
-            </div>
-            <div style="font-size:11px; color:#6F7A8D; margin-top:10px">custo/hora médio ${esc(b.rate)}</div>
-          </div>`).join('')}
-        </div>
-      </section>
-      <section>
-        <h2 style="margin:0 0 12px; font-size:15px; font-weight:500">Faturas e contas a pagar</h2>
-        <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px,1fr)); gap:12px">
-          ${V.invoices.map(i => `
-          <div style="padding:15px; border-radius:10px; border:1px solid rgba(246,253,255,.08); background:#0C1017; display:flex; flex-direction:column; gap:9px">
-            <div style="display:flex; align-items:center; justify-content:space-between">
-              <span style="font-size:12.5px; color:#C4CCDA">${esc(i.who)}</span>
-              <span style="font-size:10px; padding:3px 8px; border-radius:20px; border:1px solid ${i.color}; color:${i.color}">${esc(i.status)}</span>
-            </div>
-            <div style="font-size:19px">${esc(i.value)}</div>
-            <div style="font-size:11px; color:#6F7A8D">${esc(i.kind)} · vence ${esc(i.due)}</div>
-          </div>`).join('')}
-        </div>
-      </section>
-    </div>
+    <section>
+      <h2 style="margin:0 0 12px; font-size:15px; font-weight:500">Orçamento por projeto</h2>
+      <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(240px,1fr)); gap:12px">
+        ${V.budgets.map(b => `
+        <div style="padding:15px; border-radius:10px; border:1px solid rgba(246,253,255,.08); background:#0C1017">
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px">
+            <span style="width:7px; height:7px; border-radius:50%; background:${b.color}"></span>
+            <span style="font-size:13px">${esc(b.name)}</span>
+          </div>
+          <div style="display:flex; justify-content:space-between; font-size:11.5px; color:#6F7A8D; margin-bottom:6px">
+            <span>${esc(b.spent)} de ${esc(b.budget)}</span><span style="color:${b.pctColor}">${esc(b.pctLabel)}</span>
+          </div>
+          <div style="height:4px; border-radius:3px; background:rgba(246,253,255,.08); overflow:hidden">
+            <div style="height:100%; width:${b.pct}%; background:${b.pctColor}"></div>
+          </div>
+          <div style="font-size:11px; color:#6F7A8D; margin-top:10px">custo/hora médio ${esc(b.rate)}</div>
+        </div>`).join('')}
+      </div>
+    </section>
   </div>`;
 }
 
@@ -934,10 +881,14 @@ function tFormModal(V) {
       </div>
       <div style="padding:20px 22px; display:flex; flex-direction:column; gap:15px">
         ${V.formFields.map(f => formFieldHTML(f)).join('')}
+        ${V.inviteError ? `
+        <div style="display:flex; align-items:center; gap:8px; padding:9px 11px; border-radius:8px; border:1px solid rgba(255,77,94,.35); background:rgba(255,77,94,.08); font-size:12px; color:#FF9AA3">
+          <i class="ph ph-warning-circle" style="font-size:14px"></i>${esc(V.inviteError)}
+        </div>` : ''}
       </div>
       <div style="display:flex; gap:10px; justify-content:flex-end; padding:16px 22px; border-top:1px solid rgba(246,253,255,.07)">
         <button data-click="${on(() => setState({ openId: null, form: null }))}" style="padding:9px 15px; border-radius:8px; border:1px solid rgba(246,253,255,.14); background:none; color:#C4CCDA; font-size:12.5px"${hoverAttr('color:#F6FDFF')}>cancelar</button>
-        <button data-click="${on(() => submit())}" style="padding:9px 17px; border-radius:8px; border:1px solid #0B71F5; background:rgba(11,113,245,.16); color:#8CBEFF; font-size:12.5px"${hoverAttr('background:rgba(11,113,245,.3); color:#F6FDFF')}>${esc(V.formCta)}</button>
+        <button data-click="${on(() => submit())}" ${V.inviteBusy ? 'disabled' : ''} style="padding:9px 17px; border-radius:8px; border:1px solid #0B71F5; background:rgba(11,113,245,.16); color:#8CBEFF; font-size:12.5px"${hoverAttr('background:rgba(11,113,245,.3); color:#F6FDFF')}>${V.inviteBusy ? 'Aguarde…' : esc(V.formCta)}</button>
       </div>
     </div>
   </div>`;
@@ -949,7 +900,7 @@ function tInviteModal(V) {
   <div data-click="${on(() => setState({ showInvite: false }))}" style="position:fixed; inset:0; background:rgba(0,1,7,.72); backdrop-filter:blur(3px); display:flex; align-items:center; justify-content:center; padding:36px; z-index:45">
     <div data-click="${on(e => e.stopPropagation())}" style="width:100%; max-width:440px; border-radius:14px; border:1px solid rgba(246,253,255,.12); background:#0C1017; box-shadow:0 30px 80px rgba(0,0,0,.7); padding:22px 24px">
       <h2 style="margin:0 0 10px; font-size:17px; font-weight:400">Adicionar alguém à equipe</h2>
-      <p style="margin:0 0 18px; font-size:13px; line-height:1.6; color:#8A93A6">Não dá para criar a conta de outra pessoa por aqui. Compartilhe o link do Genesis e peça para a pessoa criar a própria conta na tela de entrada, na opção "Não tem conta? Criar conta". Assim que ela se cadastrar, aparece aqui automaticamente.</p>
+      <p style="margin:0 0 18px; font-size:13px; line-height:1.6; color:#8A93A6">Só quem tem acesso de administrador pode adicionar novas pessoas. Peça para um admin da equipe te incluir.</p>
       <button data-click="${on(() => setState({ showInvite: false }))}" style="padding:9px 15px; border-radius:8px; border:1px solid #0B71F5; background:rgba(11,113,245,.16); color:#8CBEFF; font-size:12.5px"${hoverAttr('background:rgba(11,113,245,.3); color:#F6FDFF')}>entendi</button>
     </div>
   </div>`;
