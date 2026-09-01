@@ -1,37 +1,27 @@
-import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
-import {
-  getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut
-} from "https://www.gstatic.com/firebasejs/12.18.0/firebase-auth.js";
-import {
-  getFirestore, collection, doc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, serverTimestamp
-} from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
+"use strict";
 
-const firebaseConfig = {
-  projectId: "genesis-kanban",
-  appId: "1:650461089967:web:f5faaaa8aab80e16f8c45a",
-  storageBucket: "genesis-kanban.firebasestorage.app",
-  apiKey: "AIzaSyCNbZXNQH2L_s6pUBPzBwuuMMDMeXuitaM",
-  authDomain: "genesis-kanban.firebaseapp.com",
-  messagingSenderId: "650461089967"
-};
-const firebaseApp = initializeApp(firebaseConfig);
-const auth = getAuth(firebaseApp);
-const db = getFirestore(firebaseApp);
+/* ---------- API client (talks to the Node/Express + MongoDB server in server/) ---------- */
+const API_BASE = '/api';
+let authToken = localStorage.getItem('genesis_token') || null;
 
-function mapAuthError(e) {
-  const map = {
-    'auth/invalid-email': 'E-mail inválido.',
-    'auth/user-not-found': 'Não encontramos uma conta com esse e-mail.',
-    'auth/wrong-password': 'Senha incorreta.',
-    'auth/invalid-credential': 'E-mail ou senha incorretos.',
-    'auth/email-already-in-use': 'Já existe uma conta com esse e-mail.',
-    'auth/weak-password': 'A senha precisa ter pelo menos 6 caracteres.',
-    'auth/too-many-requests': 'Muitas tentativas. Tente novamente em instantes.',
-    'auth/operation-not-allowed': 'Login por e-mail/senha ainda não foi ativado no Firebase (Authentication > Sign-in method).',
-    'auth/configuration-not-found': 'O Firebase Authentication ainda não foi ativado neste projeto (abra Authentication no console do Firebase e clique em Começar).'
-  };
-  return map[e && e.code] || 'Não foi possível completar a ação. Tente novamente.';
+async function api(path, options) {
+  const opts = Object.assign({ headers: {} }, options || {});
+  opts.headers = Object.assign({}, opts.headers);
+  if (opts.body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(opts.body); }
+  if (authToken) opts.headers['Authorization'] = 'Bearer ' + authToken;
+  const res = await fetch(API_BASE + path, opts);
+  if (res.status === 204) return null;
+  let json = null;
+  try { json = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    const err = new Error((json && json.error) || 'Erro inesperado.');
+    err.status = res.status;
+    err.apiMessage = (json && json.error) || 'Não foi possível completar a ação. Tente novamente.';
+    throw err;
+  }
+  return json;
 }
+function apiErrorMessage(e) { return (e && e.apiMessage) || 'Não foi possível completar a ação. Tente novamente.'; }
 
 /* ---------- constants ---------- */
 const COLS = [
@@ -52,8 +42,8 @@ function escAttr(s) {
 }
 function brl(v) { return 'R$ ' + (v / 1000).toFixed(0) + 'k'; }
 function timeAgo(ts) {
-  if (!ts || typeof ts.toDate !== 'function') return 'agora';
-  const diffMs = Date.now() - ts.toDate().getTime();
+  if (!ts) return 'agora';
+  const diffMs = Date.now() - new Date(ts).getTime();
   const min = Math.floor(diffMs / 60000);
   if (min < 1) return 'agora';
   if (min < 60) return 'há ' + min + ' min';
@@ -65,9 +55,8 @@ function timeAgo(ts) {
 
 /* ---------- state ---------- */
 let state = {
-  authReady: false, authed: false, currentUserId: null, usersLoaded: false,
+  authReady: false, authed: false, currentUserId: null,
   loginEmail: '', loginPass: '', loginError: '', loginBusy: false,
-  profileName: '', profileRole: '', profileError: '', profileBusy: false,
   inviteError: '', inviteBusy: false,
   screen: 'dash', projectFilter: 'all', query: '', openId: null, projectId: null,
   form: null, draft: {}, commentDraft: '', dragId: null, showInvite: false,
@@ -87,68 +76,71 @@ function project(id) { return state.projects.find(p => p.id === id) || { id: id,
 function colName(id) { return (COLS.find(c => c.id === id) || COLS[0]).name; }
 function go(screen, extra) { setState(Object.assign({ screen: screen }, extra || {})); }
 
+let pollHandle = null;
+
+async function loadAllData() {
+  const [usersRes, projectsRes, tasksRes] = await Promise.all([
+    api('/users'), api('/projects'), api('/tasks')
+  ]);
+  setState({ users: usersRes.users, projects: projectsRes.projects, tasks: tasksRes.tasks });
+}
+
+function startSession(token, userObj) {
+  authToken = token;
+  localStorage.setItem('genesis_token', token);
+  setState({ authed: true, authReady: true, currentUserId: userObj.id, loginError: '', loginPass: '', loginBusy: false });
+  loadAllData().catch(e => console.error(e));
+  if (pollHandle) clearInterval(pollHandle);
+  pollHandle = setInterval(() => { if (state.authed) loadAllData().catch(() => {}); }, 8000);
+}
+
+function stopSession() {
+  authToken = null;
+  localStorage.removeItem('genesis_token');
+  if (pollHandle) { clearInterval(pollHandle); pollHandle = null; }
+  setState({
+    authed: false, authReady: true, currentUserId: null,
+    users: [], projects: [], tasks: [], screen: 'dash', projectFilter: 'all',
+    openId: null, form: null, showInvite: false, loginBusy: false
+  });
+}
+
+async function bootstrapAuth() {
+  if (!authToken) return setState({ authReady: true });
+  try {
+    const { user: me } = await api('/auth/me');
+    startSession(authToken, me);
+  } catch (e) {
+    stopSession();
+  }
+}
+
 async function login() {
   const email = state.loginEmail.trim().toLowerCase(), pass = state.loginPass;
   if (!email || !pass) return setState({ loginError: 'Informe e-mail e senha.' });
   setState({ loginBusy: true, loginError: '' });
   try {
-    await signInWithEmailAndPassword(auth, email, pass);
+    const { token, user: userObj } = await api('/auth/login', { method: 'POST', body: { email, password: pass } });
+    startSession(token, userObj);
   } catch (e) {
-    setState({ loginError: mapAuthError(e), loginBusy: false });
+    setState({ loginError: apiErrorMessage(e), loginBusy: false });
   }
 }
 
-function logout() { signOut(auth).catch(e => console.error(e)); }
+function logout() { stopSession(); }
 
 async function inviteUser() {
   const d = state.draft;
-  const name = (d.name || '').trim(), role = (d.role || '').trim();
-  const email = (d.email || '').trim().toLowerCase(), pass = (d.pass || '').trim();
   if (!me().isAdmin) return;
-  if (!name) return setState({ inviteError: 'Informe o nome da pessoa.' });
-  if (!email || !pass) return setState({ inviteError: 'Informe e-mail e senha temporária.' });
-  if (pass.length < 6) return setState({ inviteError: 'A senha temporária precisa ter pelo menos 6 caracteres.' });
   setState({ inviteBusy: true, inviteError: '' });
-  // Uses a secondary Firebase app instance so creating the new account doesn't
-  // sign the admin out of their own session (createUserWithEmailAndPassword
-  // signs in as the newly created user on whichever auth instance it's called with).
-  const secondaryApp = initializeApp(firebaseConfig, 'invite-' + Date.now());
-  const secondaryAuth = getAuth(secondaryApp);
   try {
-    const cred = await createUserWithEmailAndPassword(secondaryAuth, email, pass);
-    const colors = ['#0B71F5', '#2ECC8F', '#B07CFF', '#F5A70B', '#FF7A86'];
-    const parts = name.split(' ');
-    const initials = (parts[0][0] + (parts[1] ? parts[1][0] : '')).toUpperCase();
-    await setDoc(doc(db, 'users', cred.user.uid), {
-      name, role: role || 'Colaborador', email, initials,
-      color: colors[Math.floor(Math.random() * colors.length)],
-      invitedBy: me().name, createdAt: serverTimestamp()
+    const { user: newUser } = await api('/users', {
+      method: 'POST',
+      body: { name: d.name, email: d.email, password: d.pass, role: d.role, isAdmin: d.isAdmin === 'true' }
     });
-    await signOut(secondaryAuth);
-    setState({ form: null, inviteBusy: false });
+    setState(s => ({ users: s.users.concat([newUser]), form: null, inviteBusy: false }));
   } catch (e) {
-    setState({ inviteError: mapAuthError(e), inviteBusy: false });
-  } finally {
-    deleteApp(secondaryApp).catch(() => {});
-  }
-}
-
-async function completeProfile() {
-  const name = state.profileName.trim(), role = state.profileRole.trim();
-  if (!name) return setState({ profileError: 'Informe seu nome.' });
-  setState({ profileBusy: true, profileError: '' });
-  const colors = ['#0B71F5', '#2ECC8F', '#B07CFF', '#F5A70B', '#FF7A86'];
-  const parts = name.split(' ');
-  const initials = (parts[0][0] + (parts[1] ? parts[1][0] : '')).toUpperCase();
-  try {
-    await setDoc(doc(db, 'users', state.currentUserId), {
-      name, role: role || 'Colaborador',
-      email: (auth.currentUser && auth.currentUser.email) || '',
-      initials, color: colors[Math.floor(Math.random() * colors.length)],
-      createdAt: serverTimestamp()
-    });
-  } catch (e) {
-    setState({ profileError: mapAuthError(e), profileBusy: false });
+    setState({ inviteError: apiErrorMessage(e), inviteBusy: false });
   }
 }
 
@@ -186,7 +178,7 @@ function openForm(kind, seed) {
     title: '', desc: '',
     projectId: (state.projects[0] && state.projects[0].id) || '',
     assigneeId: (state.users[0] && state.users[0].id) || me().id,
-    priority: 'Média', due: '', hours: '', col: 'todo', name: '', email: '', role: '', pass: ''
+    priority: 'Média', due: '', hours: '', col: 'todo', name: '', email: '', role: '', pass: '', isAdmin: 'false'
   }, seed || {});
   setState({ form: kind, draft: d, openId: null, inviteError: '' });
 }
@@ -196,22 +188,29 @@ function submit() {
   const d = state.draft, kind = state.form;
   if (kind === 'task') {
     if (!d.title.trim()) return;
-    const task = { title: d.title, desc: d.desc || 'Sem descrição.', projectId: d.projectId, assigneeId: d.assigneeId, col: d.col, priority: d.priority, due: d.due || 'sem prazo', hours: d.hours || 0, tags: [], createdBy: me().name, createdById: state.currentUserId, checklist: [], files: [], comments: [], createdAt: serverTimestamp() };
-    addDoc(collection(db, 'tasks'), task).catch(e => console.error(e));
     setState({ form: null });
+    api('/tasks', {
+      method: 'POST',
+      body: { title: d.title, desc: d.desc, projectId: d.projectId, assigneeId: d.assigneeId, col: d.col, priority: d.priority, due: d.due, hours: d.hours }
+    }).then(({ task }) => setState(s => ({ tasks: s.tasks.concat([task]) }))).catch(e => console.error(e));
   } else if (kind === 'project') {
     if (!d.name.trim()) return;
-    const colors = ['#0B71F5', '#2ECC8F', '#B07CFF', '#F5A70B', '#FF7A86'];
-    const p = { name: d.name, desc: d.desc || 'Sem descrição.', color: colors[state.projects.length % colors.length], due: d.due || 'sem prazo', status: 'Planejado', budget: Number(d.hours) * 1000 || 30000, spent: 0, rate: 'R$ 130', createdAt: serverTimestamp() };
-    addDoc(collection(db, 'projects'), p).catch(e => console.error(e));
     setState({ form: null });
+    api('/projects', { method: 'POST', body: { name: d.name, desc: d.desc, due: d.due, hours: d.hours } })
+      .then(({ project: p }) => setState(s => ({ projects: s.projects.concat([p]) }))).catch(e => console.error(e));
   } else if (kind === 'user') {
     inviteUser();
   }
 }
 
 function patchTask(id, patch) {
-  updateDoc(doc(db, 'tasks', id), patch).catch(e => console.error(e));
+  setState(s => ({ tasks: s.tasks.map(t => t.id === id ? Object.assign({}, t, patch) : t) }));
+  api('/tasks/' + id, { method: 'PATCH', body: patch }).catch(e => console.error(e));
+}
+
+function deleteTask(id) {
+  setState(s => ({ openId: null, tasks: s.tasks.filter(t => t.id !== id) }));
+  api('/tasks/' + id, { method: 'DELETE' }).catch(e => console.error(e));
 }
 
 function addComment() {
@@ -221,8 +220,8 @@ function addComment() {
   if (!t) return;
   const m = me();
   const comments = t.comments.concat([{ who: m.name, when: 'agora', text: txt, initials: m.initials, color: m.color }]);
-  updateDoc(doc(db, 'tasks', id), { comments }).catch(e => console.error(e));
   setState({ commentDraft: '' });
+  patchTask(id, { comments });
 }
 
 /* ---------- view model (ported from renderVals()) ---------- */
@@ -330,15 +329,14 @@ function computeView() {
     field('Nome', 'name', { placeholder: 'Nome completo' }),
     field('E-mail', 'email', { placeholder: 'nome@empresa.com' }),
     field('Função', 'role', { placeholder: 'ex: Engenharia' }),
-    field('Senha temporária', 'pass', { placeholder: 'pelo menos 6 caracteres' })
+    field('Senha temporária', 'pass', { placeholder: 'pelo menos 6 caracteres' }),
+    field('Também vai ser admin?', 'isAdmin', { isText: false, isSelect: true, options: [{ id: 'false', name: 'Não' }, { id: 'true', name: 'Sim, pode adicionar gente' }] })
   ];
   return {
     authReady: s.authReady, isLogin: !s.authed, authed: s.authed,
     loginBusy: s.loginBusy,
     loginEmail: s.loginEmail, loginPass: s.loginPass, loginError: s.loginError,
     showInvite: s.showInvite, inviteError: s.inviteError, inviteBusy: s.inviteBusy,
-    needsProfile: s.authed && s.usersLoaded && !s.users.find(u => u.id === s.currentUserId),
-    profileName: s.profileName, profileRole: s.profileRole, profileError: s.profileError, profileBusy: s.profileBusy,
     me: m, users: s.users, nav: nav, query: s.query,
     screenKicker: cur[0], screenTitle: cur[1],
     isDash: s.screen === 'dash', isBoard: isBoard, isProjects: s.screen === 'projects',
@@ -351,7 +349,7 @@ function computeView() {
     ],
     dashTasks: mine.filter(t => t.col !== 'done').slice(0, 4).map(t => augment(t)),
     activity: s.tasks.filter(t => t.createdAt).slice()
-      .sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis())
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
       .slice(0, 5)
       .map(t => {
         const creator = t.createdById ? user(t.createdById) : null;
@@ -857,7 +855,7 @@ function tTaskModal(V) {
               ${mt.tags.map(tag => `<span style="font-size:10.5px; padding:3px 8px; border-radius:5px; background:rgba(11,113,245,.14); color:#8CBEFF">${esc(tag)}</span>`).join('')}
             </div>
           </div>
-          <button data-click="${on(() => { deleteDoc(doc(db, 'tasks', openTask.id)).catch(e => console.error(e)); setState({ openId: null }); })}" style="margin-top:auto; padding:9px; border-radius:8px; border:1px solid rgba(255,77,94,.35); background:none; color:#FF7A86; font-size:12px"${hoverAttr('background:rgba(255,77,94,.12)')}>excluir tarefa</button>
+          <button data-click="${on(() => deleteTask(openTask.id))}" style="margin-top:auto; padding:9px; border-radius:8px; border:1px solid rgba(255,77,94,.35); background:none; color:#FF7A86; font-size:12px"${hoverAttr('background:rgba(255,77,94,.12)')}>excluir tarefa</button>
         </div>
       </div>
     </div>
@@ -920,36 +918,6 @@ function tInviteModal(V) {
   </div>`;
 }
 
-function tCompleteProfile(V) {
-  return `
-  <div style="min-height:100vh; display:flex; align-items:center; justify-content:center; background:#000107; background-image:radial-gradient(900px 600px at 78% 8%, rgba(11,113,245,.2), transparent 68%); font-size:14px; padding:24px">
-    <div style="width:100%; max-width:372px; padding:30px; border-radius:14px; border:1px solid rgba(246,253,255,.1); background:linear-gradient(165deg, #10151F, #090C13); box-shadow:0 26px 70px rgba(0,0,0,.6)">
-      <div style="display:flex; align-items:center; gap:14px; margin-bottom:20px">
-        <img src="assets/genesis-logo.jpg" alt="Genesis" style="width:40px; height:40px; object-fit:contain; filter:invert(1) brightness(1.15); mix-blend-mode:lighten">
-        <div style="font-size:16px; letter-spacing:.2em; font-weight:400">GENESIS</div>
-      </div>
-      <h2 style="margin:0 0 6px; font-size:19px; font-weight:400">Complete seu perfil</h2>
-      <p style="margin:0 0 24px; font-size:12.5px; color:#8A93A6">Sua conta já existe, só falta seu nome pra aparecer certinho no quadro da equipe.</p>
-      <div style="display:flex; flex-direction:column; gap:15px">
-        <div>
-          <div style="font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:#6F7A8D; margin-bottom:7px">Nome completo</div>
-          <input data-field="profileName" data-input="${on(e => setState({ profileName: e.target.value }))}" data-keydown="${on(e => { if (e.key === 'Enter') completeProfile(); })}" value="${escAttr(V.profileName)}" type="text" placeholder="Seu nome" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(246,253,255,.12); background:#111725; color:#F6FDFF; font-size:13px; outline:none">
-        </div>
-        <div>
-          <div style="font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:#6F7A8D; margin-bottom:7px">Função (opcional)</div>
-          <input data-field="profileRole" data-input="${on(e => setState({ profileRole: e.target.value }))}" data-keydown="${on(e => { if (e.key === 'Enter') completeProfile(); })}" value="${escAttr(V.profileRole)}" type="text" placeholder="ex: Produto, Engenharia" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(246,253,255,.12); background:#111725; color:#F6FDFF; font-size:13px; outline:none">
-        </div>
-        ${V.profileError ? `
-        <div style="display:flex; align-items:center; gap:8px; padding:9px 11px; border-radius:8px; border:1px solid rgba(255,77,94,.35); background:rgba(255,77,94,.08); font-size:12px; color:#FF9AA3">
-          <i class="ph ph-warning-circle" style="font-size:14px"></i>${esc(V.profileError)}
-        </div>` : ''}
-        <button data-click="${on(() => completeProfile())}" ${V.profileBusy ? 'disabled' : ''} style="margin-top:4px; padding:11px; border-radius:8px; border:1px solid #0B71F5; background:rgba(11,113,245,.14); color:#8CBEFF; font-size:13px"${hoverAttr('background:rgba(11,113,245,.28); color:#F6FDFF')}>${V.profileBusy ? 'Aguarde…' : 'Salvar e continuar'}</button>
-        <button data-click="${on(() => logout())}" style="background:none; border:none; color:#6F7A8D; font-size:12px; padding:4px 0; text-align:center">Sair</button>
-      </div>
-    </div>
-  </div>`;
-}
-
 function tShell(V) {
   let screenHTML = '';
   if (V.isDash) screenHTML = tDash(V);
@@ -991,7 +959,6 @@ function tApp(V) {
   if (!V.authReady) return `<div style="min-height:100vh; display:flex; align-items:center; justify-content:center; background:#000107; color:#6F7A8D; font-size:13px">Carregando…</div>`;
   if (V.isLogin) return tLogin(V);
   if (!V.authed) return '';
-  if (V.needsProfile) return tCompleteProfile(V);
   return tShell(V);
 }
 
@@ -1004,34 +971,8 @@ function render() {
   app.innerHTML = tApp(V);
 }
 
-/* ---------- Firebase auth/data wiring ---------- */
-let unsubs = [];
-function clearSubs() { unsubs.forEach(u => u()); unsubs = []; }
-
-onAuthStateChanged(auth, user => {
-  clearSubs();
-  if (user) {
-    unsubs.push(onSnapshot(collection(db, 'users'), snap => {
-      setState({ users: snap.docs.map(d => Object.assign({ id: d.id }, d.data())), usersLoaded: true });
-    }, e => console.error('users listener', e)));
-    unsubs.push(onSnapshot(collection(db, 'projects'), snap => {
-      setState({ projects: snap.docs.map(d => Object.assign({ id: d.id }, d.data())) });
-    }, e => console.error('projects listener', e)));
-    unsubs.push(onSnapshot(collection(db, 'tasks'), snap => {
-      setState({ tasks: snap.docs.map(d => Object.assign({ id: d.id }, d.data())) });
-    }, e => console.error('tasks listener', e)));
-    setState({ authed: true, authReady: true, currentUserId: user.uid, loginError: '', loginPass: '', loginBusy: false });
-  } else {
-    setState({
-      authed: false, authReady: true, currentUserId: null, usersLoaded: false,
-      users: [], projects: [], tasks: [], screen: 'dash', projectFilter: 'all',
-      openId: null, form: null, showInvite: false, loginBusy: false,
-      profileName: '', profileRole: '', profileError: '', profileBusy: false
-    });
-  }
-});
-
 document.addEventListener('DOMContentLoaded', () => {
   bindOnce();
   render();
+  bootstrapAuth();
 });
