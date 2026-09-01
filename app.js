@@ -51,6 +51,17 @@ function escAttr(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 function brl(v) { return 'R$ ' + (v / 1000).toFixed(0) + 'k'; }
+function timeAgo(ts) {
+  if (!ts || typeof ts.toDate !== 'function') return 'agora';
+  const diffMs = Date.now() - ts.toDate().getTime();
+  const min = Math.floor(diffMs / 60000);
+  if (min < 1) return 'agora';
+  if (min < 60) return 'há ' + min + ' min';
+  const h = Math.floor(min / 60);
+  if (h < 24) return 'há ' + h + ' h';
+  const d = Math.floor(h / 24);
+  return 'há ' + d + (d === 1 ? ' dia' : ' dias');
+}
 
 /* ---------- state ---------- */
 let state = {
@@ -185,7 +196,7 @@ function submit() {
   const d = state.draft, kind = state.form;
   if (kind === 'task') {
     if (!d.title.trim()) return;
-    const task = { title: d.title, desc: d.desc || 'Sem descrição.', projectId: d.projectId, assigneeId: d.assigneeId, col: d.col, priority: d.priority, due: d.due || 'sem prazo', hours: d.hours || 0, tags: [], createdBy: me().name, checklist: [], files: [], comments: [], createdAt: serverTimestamp() };
+    const task = { title: d.title, desc: d.desc || 'Sem descrição.', projectId: d.projectId, assigneeId: d.assigneeId, col: d.col, priority: d.priority, due: d.due || 'sem prazo', hours: d.hours || 0, tags: [], createdBy: me().name, createdById: state.currentUserId, checklist: [], files: [], comments: [], createdAt: serverTimestamp() };
     addDoc(collection(db, 'tasks'), task).catch(e => console.error(e));
     setState({ form: null });
   } else if (kind === 'project') {
@@ -339,13 +350,15 @@ function computeView() {
       { label: 'Concluídas', value: String(s.tasks.filter(t => t.col === 'done').length), sub: 'no total', icon: 'ph ph-check-circle' }
     ],
     dashTasks: mine.filter(t => t.col !== 'done').slice(0, 4).map(t => augment(t)),
-    activity: [
-      { initials: 'RC', color: '#2ECC8F', text: 'Rafael moveu Definir arquitetura do módulo de tarefas para Em Andamento', when: 'há 20 min' },
-      { initials: 'JM', color: '#B07CFF', text: 'Júlia enviou Protótipo do kanban para Revisão', when: 'há 2 h' },
-      { initials: 'DP', color: '#F5A70B', text: 'Diego criou a tarefa Pipeline de vendas no CRM e atribuiu a si mesmo', when: 'ontem' },
-      { initials: 'CR', color: '#FF7A86', text: 'Camila atualizou o orçamento do projeto Integração pagamentos', when: 'ontem' },
-      { initials: 'MA', color: '#0B71F5', text: 'Marina concluiu Definir metas do trimestre', when: '2 dias' }
-    ],
+    activity: s.tasks.filter(t => t.createdAt).slice()
+      .sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis())
+      .slice(0, 5)
+      .map(t => {
+        const creator = t.createdById ? user(t.createdById) : null;
+        const label = (creator || { name: t.createdBy || 'Alguém' }).name.split(' ')[0];
+        const u = creator || { initials: '—', color: '#5F6878' };
+        return { initials: u.initials, color: u.color, text: label + ' criou a tarefa ' + t.title, when: timeAgo(t.createdAt) };
+      }),
 
     projectFilters: projectFilters,
     board: buildBoard(boardList, s.projectFilter === 'all' ? null : s.projectFilter),
@@ -607,14 +620,15 @@ function tDash(V) {
       <section>
         <h2 style="margin:0 0 12px; font-size:15px; font-weight:500">Atividade da equipe</h2>
         <div style="display:flex; flex-direction:column; gap:10px">
-          ${V.activity.map(a => `
+          ${V.activity.length ? V.activity.map(a => `
           <div style="display:flex; gap:11px; padding:12px 13px; border-radius:10px; border:1px solid rgba(246,253,255,.07); background:#0C1017">
             <div style="width:26px; height:26px; flex:none; border-radius:50%; background:${a.color}22; border:1px solid ${a.color}66; color:${a.color}; font-size:10px; display:flex; align-items:center; justify-content:center">${esc(a.initials)}</div>
             <div style="min-width:0">
               <div style="font-size:12.5px; line-height:1.45; color:#C4CCDA; text-wrap:pretty">${esc(a.text)}</div>
               <div style="font-size:10.5px; color:#5F6878; margin-top:3px">${esc(a.when)}</div>
             </div>
-          </div>`).join('')}
+          </div>`).join('') : `
+          <div style="padding:20px 13px; border-radius:10px; border:1px dashed rgba(246,253,255,.1); color:#6F7A8D; font-size:12.5px; text-align:center">Nenhuma atividade ainda.</div>`}
         </div>
       </section>
     </div>
