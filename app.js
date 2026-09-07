@@ -136,7 +136,7 @@ async function inviteUser() {
   try {
     const { user: newUser } = await api('/users', {
       method: 'POST',
-      body: { name: d.name, email: d.email, password: d.pass, role: d.role, isAdmin: d.isAdmin === 'true' }
+      body: { name: d.name, email: d.email, password: d.pass, role: d.role, isAdmin: d.isAdmin === 'true', githubUsername: d.githubUsername }
     });
     setState(s => ({ users: s.users.concat([newUser]), form: null, inviteBusy: false }));
   } catch (e) {
@@ -178,7 +178,7 @@ function openForm(kind, seed) {
     title: '', desc: '',
     projectId: (state.projects[0] && state.projects[0].id) || '',
     assigneeId: (state.users[0] && state.users[0].id) || me().id,
-    priority: 'Média', due: '', hours: '', col: 'todo', name: '', email: '', role: '', pass: '', isAdmin: 'false'
+    priority: 'Média', due: '', hours: '', col: 'todo', name: '', email: '', role: '', pass: '', isAdmin: 'false', githubUsername: ''
   }, seed || {});
   setState({ form: kind, draft: d, openId: null, inviteError: '' });
 }
@@ -330,6 +330,7 @@ function computeView() {
     field('E-mail', 'email', { placeholder: 'nome@empresa.com' }),
     field('Função', 'role', { placeholder: 'ex: Engenharia' }),
     field('Senha temporária', 'pass', { placeholder: 'pelo menos 6 caracteres' }),
+    field('Usuário no GitHub (opcional)', 'githubUsername', { placeholder: 'pra receber issues atribuídas automaticamente' }),
     field('Também vai ser admin?', 'isAdmin', { isText: false, isSelect: true, options: [{ id: 'false', name: 'Não' }, { id: 'true', name: 'Sim, pode adicionar gente' }] })
   ];
   return {
@@ -549,7 +550,8 @@ function taskCard(t, small) {
   <div draggable="true" data-dragstart="${on(e => { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', t.id); state.dragId = t.id; })}" data-click="${on(() => setState({ openId: t.id, commentDraft: '' }))}" style="padding:12px; border-radius:9px; border:1px solid rgba(246,253,255,.08); background:#111725; cursor:pointer; display:flex; flex-direction:column; gap:9px; box-shadow:0 1px 2px rgba(0,0,0,.5)"${hoverAttr('border-color:rgba(11,113,245,.55); background:#141B2B')}>
     <div style="display:flex; align-items:center; gap:7px">
       <span style="width:5px; height:5px; border-radius:50%; background:${t.projectColor}"></span>
-      <span style="font-size:10.5px; color:#8A93A6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis">${esc(t.projectName)}</span>
+      <span style="font-size:10.5px; color:#8A93A6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1">${esc(t.projectName)}</span>
+      ${t.githubUrl ? `<a href="${escAttr(t.githubUrl)}" target="_blank" rel="noopener" data-click="${on(e => e.stopPropagation())}" title="Ver Issue #${t.githubIssueNumber} no GitHub" style="color:#6F7A8D; display:flex"${hoverAttr('color:#8CBEFF')}><i class="ph ph-github-logo" style="font-size:13px"></i></a>` : ''}
     </div>
     <div style="font-size:13px; line-height:1.35; text-wrap:pretty">${esc(t.title)}</div>
     <div style="display:flex; gap:5px; flex-wrap:wrap">
@@ -772,6 +774,7 @@ function tTaskModal(V) {
             <span style="width:6px; height:6px; border-radius:50%; background:${mt.projectColor}"></span>
             <span style="font-size:11.5px; color:#8A93A6">${esc(mt.projectName)}</span>
             <span style="font-size:11px; color:#5F6878">#${esc(mt.id)}</span>
+            ${mt.githubUrl ? `<a href="${escAttr(mt.githubUrl)}" target="_blank" rel="noopener" style="display:flex; align-items:center; gap:4px; font-size:11px; color:#6F7A8D"${hoverAttr('color:#8CBEFF')}><i class="ph ph-github-logo" style="font-size:13px"></i>Issue #${mt.githubIssueNumber}</a>` : ''}
           </div>
           <h2 style="margin:0; font-size:20px; font-weight:400; line-height:1.3; text-wrap:pretty">${esc(mt.title)}</h2>
         </div>

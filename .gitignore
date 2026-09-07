@@ -4,3 +4,4 @@ Thumbs.db
 *.log
 server/node_modules/
 server/.env
+mcp/node_modules/

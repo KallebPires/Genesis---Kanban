@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { getDb, ObjectId } = require('./db');
 
 function toPublicUser(doc) {
@@ -11,6 +12,7 @@ function toPublicUser(doc) {
     initials: doc.initials,
     color: doc.color,
     isAdmin: !!doc.isAdmin,
+    githubUsername: doc.githubUsername || '',
     createdAt: doc.createdAt
   };
 }
@@ -46,4 +48,32 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-module.exports = { toPublicUser, signToken, requireAuth, requireAdmin };
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a));
+  const bufB = Buffer.from(String(b));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+const SERVICE_USER = { id: 'service', name: 'Integração (MCP/GPT)', role: 'Serviço', isAdmin: true };
+
+function matchesApiKey(req) {
+  const key = req.headers['x-api-key'];
+  return !!(key && process.env.MCP_API_KEY && safeEqual(key, process.env.MCP_API_KEY));
+}
+
+// Lets an automated client (the local MCP server, or a ChatGPT Custom GPT Action)
+// authenticate with a single static key instead of a per-user login. Falls back to
+// normal JWT auth (any logged-in user) when no key is sent.
+async function requireAuthOrApiKey(req, res, next) {
+  if (matchesApiKey(req)) { req.user = SERVICE_USER; return next(); }
+  return requireAuth(req, res, next);
+}
+
+// Same, but requires admin when falling back to a JWT (the API key always counts as admin).
+async function requireAdminOrApiKey(req, res, next) {
+  if (matchesApiKey(req)) { req.user = SERVICE_USER; return next(); }
+  return requireAuth(req, res, () => requireAdmin(req, res, next));
+}
+
+module.exports = { toPublicUser, signToken, requireAuth, requireAdmin, requireAuthOrApiKey, requireAdminOrApiKey };

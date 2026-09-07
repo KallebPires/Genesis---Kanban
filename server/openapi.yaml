@@ -1,0 +1,267 @@
+openapi: 3.1.0
+info:
+  title: Genesis Kanban API
+  description: >
+    API do Genesis Kanban — projetos, tarefas, equipe e sincronização de
+    Issues do GitHub. Use para consultar e manipular o quadro em nome da
+    equipe. Cada chamada de escrita fica registrada como feita por
+    "Integração (MCP/GPT)" no histórico de atividade.
+  version: "1.0.0"
+servers:
+  - url: https://SUBSTITUA-PELO-DOMINIO-DA-VPS
+security:
+  - ApiKeyAuth: []
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+  schemas:
+    Project:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        desc: { type: string }
+        color: { type: string }
+        due: { type: string }
+        status: { type: string }
+        budget: { type: number }
+        spent: { type: number }
+        rate: { type: string }
+    Task:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        desc: { type: string }
+        projectId: { type: string }
+        assigneeId: { type: string }
+        col: { type: string, enum: [backlog, todo, doing, review, done] }
+        priority: { type: string, enum: [Alta, Média, Baixa] }
+        due: { type: string }
+        hours: { type: number }
+        tags: { type: array, items: { type: string } }
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        role: { type: string }
+        email: { type: string }
+        isAdmin: { type: boolean }
+    GithubRepo:
+      type: object
+      properties:
+        id: { type: string }
+        owner: { type: string }
+        repo: { type: string }
+        projectId: { type: string }
+        lastSyncedAt: { type: string, nullable: true }
+paths:
+  /api/projects:
+    get:
+      operationId: listProjects
+      summary: Lista todos os projetos do Kanban
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects: { type: array, items: { $ref: '#/components/schemas/Project' } }
+    post:
+      operationId: createProject
+      summary: Cria um novo projeto
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                desc: { type: string }
+                due: { type: string }
+                hours: { type: number, description: "Orçamento em milhares de reais" }
+      responses:
+        "201":
+          description: Criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  project: { $ref: '#/components/schemas/Project' }
+
+  /api/tasks:
+    get:
+      operationId: listTasks
+      summary: Lista todas as tarefas do Kanban
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks: { type: array, items: { $ref: '#/components/schemas/Task' } }
+    post:
+      operationId: createTask
+      summary: Cria uma nova tarefa em um projeto
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, projectId]
+              properties:
+                title: { type: string }
+                desc: { type: string }
+                projectId: { type: string }
+                assigneeId: { type: string }
+                col: { type: string, enum: [backlog, todo, doing, review, done] }
+                priority: { type: string, enum: [Alta, Média, Baixa] }
+                due: { type: string }
+                hours: { type: number }
+      responses:
+        "201":
+          description: Criada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task: { $ref: '#/components/schemas/Task' }
+
+  /api/tasks/{id}:
+    patch:
+      operationId: updateTask
+      summary: >
+        Atualiza uma tarefa (mover de coluna, trocar responsável/prioridade,
+        etc). Se a tarefa vier de uma Issue do GitHub, mover para "done"
+        fecha a issue automaticamente, e tirar de "done" reabre.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                desc: { type: string }
+                col: { type: string, enum: [backlog, todo, doing, review, done] }
+                assigneeId: { type: string }
+                priority: { type: string, enum: [Alta, Média, Baixa] }
+                due: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task: { $ref: '#/components/schemas/Task' }
+    delete:
+      operationId: deleteTask
+      summary: Exclui uma tarefa permanentemente
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204":
+          description: Excluída
+
+  /api/users:
+    get:
+      operationId: listUsers
+      summary: Lista as pessoas da equipe
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users: { type: array, items: { $ref: '#/components/schemas/User' } }
+    post:
+      operationId: inviteUser
+      summary: Convida uma nova pessoa pra equipe (cria a conta dela)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name: { type: string }
+                email: { type: string }
+                password: { type: string, description: "Senha temporária, mínimo 6 caracteres" }
+                role: { type: string }
+                isAdmin: { type: boolean }
+      responses:
+        "201":
+          description: Criada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+
+  /api/github/repos:
+    get:
+      operationId: listGithubRepos
+      summary: Lista repositórios do GitHub conectados ao Kanban
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repos: { type: array, items: { $ref: '#/components/schemas/GithubRepo' } }
+    post:
+      operationId: connectGithubRepo
+      summary: >
+        Conecta um repositório do GitHub ao Kanban (cria um projeto e importa
+        as Issues como tarefas). O repositório não é fixo: informe qual
+        conectar a cada chamada.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [owner, repo]
+              properties:
+                owner: { type: string, description: "Dono do repositório (usuário ou organização)" }
+                repo: { type: string, description: "Nome do repositório" }
+      responses:
+        "201":
+          description: Conectado
+
+  /api/github/sync:
+    post:
+      operationId: syncGithub
+      summary: Força uma sincronização imediata de todos os repositórios GitHub conectados
+      responses:
+        "200":
+          description: OK
